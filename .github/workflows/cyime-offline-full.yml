@@ -52,7 +52,7 @@ jobs:
           cache-dependency-path: cyime-src/gradle/wrapper/gradle-wrapper.properties
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install NDK and build-tools
         run: |
