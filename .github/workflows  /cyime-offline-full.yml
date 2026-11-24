@@ -4,9 +4,9 @@
 name: CyIME Offline Full Auto Build
 
 on:
-  #schedule:
+  schedule:
     # UTC 17:17 = 北京时间次日 01:17，错开整点避免排队丢弃
-    #- cron: '17 17 * * *'
+    - cron: '17 17 * * *'
   workflow_dispatch:
 
 permissions:
