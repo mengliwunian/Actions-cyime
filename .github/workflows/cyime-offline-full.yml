@@ -319,6 +319,53 @@ jobs:
           patch('app/src/main/assets/NOTICE.txt', notice_bundled,
                 'NOTICE.txt: translation models marked bundled', allow_noop=True)
 
+          # 5) 离线翻译引擎库 libcytranslate.so：上游写死的 prebuilt 哈希从未上传到
+          #    Release/ModelScope，任何 CI 构建都会在此失败。官方 full APK 里有这个库，
+          #    本 workflow 会先提取它到本地目录（见下一步），这里把哈希改成实际值并
+          #    只保留 arm64-v8a（x86_64 库任何已发布产物里都没有，源码本就注明不支持）。
+          def patch_translate_lib(text):
+              if 'offline-full patch: local translate library' in text:
+                  return text
+              apk_lib_sha = 'a95f931495a5e87e5af29b04b7fbee09ce7fce2231c5c1e86c2363b3a99eb252'
+              pat = re.compile(
+                  r'val offlineTranslateLibraryHashes\s*=\s*mapOf<String,\s*String>\s*\((.*?)\)\s*\n',
+                  re.S)
+              m = pat.search(text)
+              if not m:
+                  fail('cannot find offlineTranslateLibraryHashes map in tasks-offline-translate.gradle.kts')
+              new_map = (
+                  'val offlineTranslateLibraryHashes = mapOf<String, String>(\n'
+                  f'    "arm64-v8a" to "{apk_lib_sha}",  // offline-full patch: local translate library\n'
+                  ')\n'
+              )
+              return text[:m.start()] + new_map + text[m.end():]
+
+          patch('app/build-logic/tasks-offline-translate.gradle.kts', patch_translate_lib,
+                'translate library hash -> arm64 from official APK', allow_noop=True)
+
+          # 6) 只构建 arm64-v8a：收紧 ndk.abiFilters 与 splits.abi.include，并关闭 universal APK。
+          #    这样 Gradle 只产出一个 arm64-v8a APK，不再生成 armeabi-v7a / x86 / x86_64 / universal。
+          def restrict_to_arm64(text):
+              if 'offline-full patch: arm64 only' in text:
+                  return text
+              replacements = (
+                  ('abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")',
+                   'abiFilters += listOf("arm64-v8a")  // offline-full patch: arm64 only'),
+                  ('include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")',
+                   'include("arm64-v8a")  // offline-full patch: arm64 only'),
+                  ('isUniversalApk = true',
+                   'isUniversalApk = false  // offline-full patch: arm64 only'),
+              )
+              for old, _ in replacements:
+                  if old not in text:
+                      fail(f'ABI config not found upstream: {old}')
+              for old, new in replacements:
+                  text = text.replace(old, new, 1)
+              return text
+
+          patch('app/build.gradle.kts', restrict_to_arm64,
+                'arm64-v8a only (no other ABI / no universal)', allow_noop=True)
+
           print('All patches applied successfully.', flush=True)
           PY
 
@@ -328,12 +375,41 @@ jobs:
           echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           git diff --stat
 
+      # libcytranslate.so 从未上传到任何 Release/ModelScope，只能从官方 full APK 提取。
+      # 提取一次后用 actions/cache 缓存，之后无需重复下载 470MB 的 APK。
+      - name: Cache offline translate library
+        id: cache-translate-lib
+        uses: actions/cache@v4
+        with:
+          path: cyime-src/.codex-artifacts/offline-translate
+          key: translate-lib-a95f9314-v1
+
+      - name: Extract libcytranslate.so from official full APK
+        if: steps.cache-translate-lib.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          LIBDIR="cyime-src/.codex-artifacts/offline-translate/libs/arm64-v8a"
+          EXPECT="a95f931495a5e87e5af29b04b7fbee09ce7fce2231c5c1e86c2363b3a99eb252"
+          APK_URL="https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/app/1.15.106/CyIME-1.15.106-full-arm64-v8a.apk"
+          mkdir -p "$LIBDIR" work/apk
+          curl -sSL --retry 3 --max-time 600 "$APK_URL" -o work/apk/full.apk
+          unzip -o -q work/apk/full.apk 'lib/arm64-v8a/libcytranslate.so' -d work/apk/extract
+          cp work/apk/extract/lib/arm64-v8a/libcytranslate.so "$LIBDIR/libcytranslate.so"
+          GOT="$(sha256sum "$LIBDIR/libcytranslate.so" | cut -d' ' -f1)"
+          if [[ "$GOT" != "$EXPECT" ]]; then
+            echo "::error::extracted libcytranslate.so SHA mismatch: $GOT (expected $EXPECT)"
+            exit 1
+          fi
+          echo "libcytranslate.so extracted and verified: $GOT"
+          rm -rf work/apk
+
       - name: Build offline-full Release APKs
         working-directory: cyime-src
         run: |
           ./gradlew assembleRelease \
             -PbundleModels=true \
             -PpythonExecutable=python3 \
+            -Pcyime.translateLibDir="$GITHUB_WORKSPACE/cyime-src/.codex-artifacts/offline-translate/libs" \
             -PversionCode="${BUILD_DATE}" \
             -PversionName="offline-${BUILD_DATE}-${SHORT_SHA}" \
             --no-daemon
@@ -358,6 +434,14 @@ jobs:
           DIR="cyime-src/app/build/outputs/apk/release"
 
           mapfile -t ALL < <(find "$DIR" -maxdepth 1 -type f -name '*.apk' | sort)
+          # 只保留 arm64-v8a 产物（忽略可能残留的 universal / 其他架构 APK）
+          ARM64=()
+          for f in "${ALL[@]}"; do
+            case "$f" in *arm64-v8a*.apk) ARM64+=("$f");; esac
+          done
+          if ((${#ARM64[@]} > 0)); then
+            ALL=("${ARM64[@]}")
+          fi
           SIGNED=()
           for f in "${ALL[@]}"; do
             case "$f" in *-signed.apk) SIGNED+=("$f");; esac
@@ -389,6 +473,7 @@ jobs:
 
           - 基于上游 \`Cyletix/CyIME\` main 分支提交 \`${SHORT_SHA}\`
           - 内置：离线语音、拍照识别（OCR）、离线翻译中译英 / 英译中
+          - 架构：仅 arm64-v8a（不产物其他架构 / universal 包）
           - 已移除 Manifest 中的 INTERNET / ACCESS_WIFI_STATE / ACCESS_NETWORK_STATE / REQUEST_INSTALL_PACKAGES 声明
           - 模型许可：Firefox Translations（MPL-2.0）、PP-OCRv5 / OpenCV（Apache-2.0）、SenseVoice（FunASR 许可）
           - 项目许可：GPL-3.0；改造源码仓库需按 GPL-3.0 公开并保留上游版权声明
