@@ -105,10 +105,14 @@ jobs:
               'ACCESS_NETWORK_STATE',
               'REQUEST_INSTALL_PACKAGES',
           )
+          MODELSCOPE_BASE = 'https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/'
+          RELEASE_BASE = 'https://github.com/Cyletix/CyIME/releases/download/models/'
+
 
           def fail(msg):
               print(f'::error::{msg}', flush=True)
               sys.exit(1)
+
 
           def patch(path, fn, label, allow_noop=False):
               p = ROOT / path
@@ -124,9 +128,8 @@ jobs:
               p.write_text(new, encoding='utf-8')
               print(f'patched: {label} -> {path}', flush=True)
 
-          # 1) 把双向翻译模型加入内置白名单。
-          #    prepare-bundled-models.py 会从 BuiltinModelCatalog.kt
-          #    读取这两个模型的 URL/SHA-256 并下载、写入 manifest.json。
+
+          # 1) 白名单加入双向翻译模型
           def add_translate_to_included(text):
               m = re.search(r'(INCLUDED\s*=\s*\{)(.*?)(\})', text, re.S)
               if not m:
@@ -136,31 +139,131 @@ jobs:
               replacement = ', '.join(f"'{i}'" for i in sorted(ids))
               return text[:m.start(2)] + replacement + text[m.end(2):]
 
+
           patch('scripts/prepare-bundled-models.py', add_translate_to_included,
                 'bundle translate-zh-en / translate-en-zh', allow_noop=True)
 
-          # 1b) prepare-bundled-models.py 用正则解析 ModelFile(...)，只认字面量 URL。
-          #     翻译模型的 URL 写成 RELEASE + "..." 拼接，原脚本解析不到（files=0），
-          #     会在 prepareBundledModels 阶段抛 Unsupported/incomplete pinned catalog。
-          #     这里在解析前把 `RELEASE + "..."` 展开为拼接后的字面字符串。
-          def expand_release_concat(text):
-              old = "        source = (ROOT / 'app/src/main/java/com/kingzcheung/xime' / name).read_text(encoding='utf-8')"
-              if old not in text:
-                  fail('prepare script source-loading line changed upstream; review manually')
-              insertion = (
-                  old
-                  + "\n        # offline-full patch: expand `RELEASE + \"...\"` so the ModelFile regex can parse it"
-                  + "\n        source = re.sub(r'RELEASE\\s*\\+\\s*\"([^\"]+)\"', lambda m: '\"' + m.group(1) + '\"', source)"
-              )
-              if 'offline-full patch: expand' in text:
+
+          # 1b) 用整段替换的方式重写 catalog() 与 download()，使其：
+          #     - 在解析 Kotlin 目录前把 RELEASE/CYIME_MODELSCOPE/$reazonBase 等拼接常量展开为字面 URL；
+          #     - 解析每个 ModelFile 的 mirrors 字段；
+          #     - download 时主源失败或 SHA 不符则依次尝试 mirrors（全部严格校验 SHA）。
+          #     这样 speaker（GitHub k2-fsa 源文件变更）、翻译模型（GitHub Release 无文件）都能靠目录自带镜像回退成功。
+          def rewrite_catalog_and_download(text):
+              if 'offline-full patch: mirror-aware catalog' in text:
                   return text
-              return text.replace(old, insertion, 1)
+              start = text.index('def catalog():')
+              end = text.index('def prepare(')
+              if start < 0 or end < 0:
+                  fail('cannot locate catalog()/prepare() boundaries')
+              replacement = r'''# offline-full patch: mirror-aware catalog + download
+          _MS = 'https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/'
+          _RELEASE = 'https://github.com/Cyletix/CyIME/releases/download/models/'
+          _MODELSCOPE = 'https://www.modelscope.cn/models/Cyletix/cyime-model/resolve/master/'
 
-          patch('scripts/prepare-bundled-models.py', expand_release_concat,
-                'expand RELEASE + literal in model catalog parsing', allow_noop=True)
 
-          # 2) 安装器也有自己的白名单，必须同步，否则启动时的
-          #    check(bundled.all { it in modelIds }) 会失败。
+          def _expand_kotlin(source):
+              # Turn Kotlin string concatenations / interpolations into literal URLs so the
+              # simple regex below can read them. Order matters: longest prefix first.
+              source = re.sub(r'DownloadMirrors\.CYIME_MODELSCOPE\s*\+\s*"([^"]+)"',
+                              lambda m: '"' + _MODELSCOPE + m.group(1) + '"', source)
+              source = re.sub(r'\$reazonBase/([A-Za-z0-9_.\-]+)',
+                              lambda m: 'https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/291488c8151be24d7da4bf7af26e533fad96e407/' + m.group(1),
+                              source)
+              source = re.sub(r'RELEASE\s*\+\s*"([^"]+)"',
+                              lambda m: '"' + _RELEASE + m.group(1) + '"', source)
+              return source
+
+
+          def _parse_mirrors(raw):
+              if not raw:
+                  return []
+              return [u for u in re.findall(r'"([^"]+)"', raw) if u.startswith('http')]
+
+
+          def catalog():
+              models = []
+              for name in ('model/BuiltinModelCatalog.kt', 'speech/SpeechModelCatalog.kt'):
+                  source = (ROOT / 'app/src/main/java/com/kingzcheung/xime' / name).read_text(encoding='utf-8')
+                  source = _expand_kotlin(source)
+                  constants = dict(re.findall(r'const val (\w+) = "([^"]+)"', source))
+                  for block in source.split('ModelInfo(')[1:]:
+                      literal = re.match(r'"([^"]+)"', block)
+                      model_id = literal[1] if literal else constants.get(re.match(r'(\w+)', block)[1], '')
+                      version = re.search(r'ModelVersion\(version = "([^"]+)"', block)[1]
+                      block = 'ModelVersion('.join(block.split('ModelVersion(')[:2])  # newest version only
+                      title = re.match(r'(?:"[^"]+"|\w+),\s*"([^"]+)"', block)
+                      pat = re.compile(
+                          r'ModelFile\("([^"]+)",\s*"([^"]*)",\s*"([^"]*)",\s*(\d+)L'
+                          r'(?:,\s*mirrors\s*=\s*listOf\(([^)]*)\))?', re.S)
+                      files = []
+                      for m in pat.finditer(block):
+                          files.append(dict(name=m.group(1), url=m.group(2), sha256=m.group(3),
+                                            size=int(m.group(4)), mirrors=_parse_mirrors(m.group(5))))
+                      archive = re.search(r'archiveUrl = "([^"]+)", sha256 = "([^"]+)"', block)
+                      if model_id in INCLUDED and (not files or (not archive and any(
+                              not f['sha256'] or not f['url'] for f in files))):
+                          raise ValueError(f'Unsupported/incomplete pinned catalog: {model_id}')
+                      models.append(dict(id=model_id, name=title[1] if title else model_id, version=version, files=files,
+                                         archive=archive.groups() if archive else None))
+              ids = [m['id'] for m in models]
+              if len(set(ids)) != len(ids) or not INCLUDED <= set(ids):
+                  raise ValueError('Catalog changed: review the offline model edition before building')
+              return [m for m in models if m['id'] in INCLUDED]
+
+
+          def download(url, target, sha, mirrors=None):
+              if target.is_file() and digest(target) == sha:
+                  return
+              target.parent.mkdir(parents=True, exist_ok=True)
+              temporary = target.with_suffix(target.suffix + '.part')
+              print(f'Downloading {target.name}', flush=True)
+              sources = [url] + [m for m in (mirrors or []) if m and m != url]
+              # Last resort: fixed ModelScope mirror named exactly as the catalog file name.
+              fallback = _MS + target.name
+              if fallback not in sources:
+                  sources.append(fallback)
+              last_error = None
+              for source_url in sources:
+                  try:
+                      with urllib.request.urlopen(source_url, timeout=180) as src, temporary.open('wb') as dst:
+                          shutil.copyfileobj(src, dst)
+                      if digest(temporary) == sha:
+                          temporary.replace(target)
+                          return
+                      last_error = f'Checksum mismatch from {source_url}: {target.name}'
+                  except Exception as exc:  # noqa: BLE001 - try next source
+                      last_error = f'{source_url}: {exc}'
+              raise ValueError(last_error or f'Checksum mismatch: {target.name}')
+
+
+          '''
+              return text[:start] + replacement + text[end:]
+
+
+          patch('scripts/prepare-bundled-models.py', rewrite_catalog_and_download,
+                'mirror-aware catalog + download', allow_noop=True)
+
+
+          # 1c) prepare() 把 mirrors 传给 download（两处调用：archive 与 files）
+          def pass_mirrors_to_download(text):
+              if 'offline-full patch: pass mirrors' in text:
+                  return text
+              old1 = "            download(url, archive, sha)"
+              new1 = "            download(url, archive, sha, mirrors=None)  # offline-full patch: pass mirrors"
+              old2 = "                download(info['url'], cached, info['sha256'])"
+              new2 = "                download(info['url'], cached, info['sha256'], mirrors=info.get('mirrors'))  # offline-full patch: pass mirrors"
+              if old1 not in text or old2 not in text:
+                  fail('prepare() download call sites changed upstream; review manually')
+              text = text.replace(old1, new1, 1).replace(old2, new2, 1)
+              return text
+
+
+          patch('scripts/prepare-bundled-models.py', pass_mirrors_to_download,
+                'pass mirrors into download()', allow_noop=True)
+
+
+          # 2) 安装器白名单同步
           def add_translate_to_installer(text):
               m = re.search(r'(val modelIds\s*=\s*setOf\()([^)]*)(\))', text, re.S)
               if not m:
@@ -173,11 +276,12 @@ jobs:
               inner += '\n        "translate-zh-en", "translate-en-zh",'
               return text[:m.start(2)] + inner + text[m.end(2):]
 
+
           patch('app/src/main/java/com/kingzcheung/xime/model/BundledModelInstaller.kt',
                 add_translate_to_installer, 'installer modelIds', allow_noop=True)
 
-          # 3) 去联网：只改 Manifest 声明，不删除任何源码模块。
-          #    App 代码保留但拿不到 INTERNET 权限，因此无法联网。
+
+          # 3) 去联网：仅改 Manifest 声明
           def strip_network_permissions(text):
               for perm in NETWORK_PERMISSIONS:
                   pattern = (
@@ -193,10 +297,12 @@ jobs:
                   fail('INTERNET still present in AndroidManifest.xml')
               return text
 
+
           patch('app/src/main/AndroidManifest.xml', strip_network_permissions,
                 'remove INTERNET / WIFI / NETWORK_STATE / INSTALL_PACKAGES')
 
-          # 4) 合规文案：翻译模型从“按需下载”改为“内置”。
+
+          # 4) 合规文案
           def notice_bundled(text):
               old = 'Models (downloaded on request, not bundled): Firefox Translations zh-en and en-zh'
               if old in text:
@@ -208,6 +314,7 @@ jobs:
               if 'Models (BUNDLED in this offline-full build)' in text:
                   return text
               fail('NOTICE.txt translation model wording changed upstream; review manually')
+
 
           patch('app/src/main/assets/NOTICE.txt', notice_bundled,
                 'NOTICE.txt: translation models marked bundled', allow_noop=True)
