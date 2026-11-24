@@ -49,15 +49,14 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: gradle
+          cache-dependency-path: cyime-src/gradle/wrapper/gradle-wrapper.properties
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
 
-      - name: Install NDK
+      - name: Install NDK and build-tools
         run: |
-          sdkmanager "ndk;29.0.14206865"
+          sdkmanager "platform-tools" "build-tools;36.0.0" "ndk;29.0.14206865"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
@@ -140,6 +139,26 @@ jobs:
           patch('scripts/prepare-bundled-models.py', add_translate_to_included,
                 'bundle translate-zh-en / translate-en-zh', allow_noop=True)
 
+          # 1b) prepare-bundled-models.py 用正则解析 ModelFile(...)，只认字面量 URL。
+          #     翻译模型的 URL 写成 RELEASE + "..." 拼接，原脚本解析不到（files=0），
+          #     会在 prepareBundledModels 阶段抛 Unsupported/incomplete pinned catalog。
+          #     这里在解析前把 `RELEASE + "..."` 展开为拼接后的字面字符串。
+          def expand_release_concat(text):
+              old = "        source = (ROOT / 'app/src/main/java/com/kingzcheung/xime' / name).read_text(encoding='utf-8')"
+              if old not in text:
+                  fail('prepare script source-loading line changed upstream; review manually')
+              insertion = (
+                  old
+                  + "\n        # offline-full patch: expand `RELEASE + \"...\"` so the ModelFile regex can parse it"
+                  + "\n        source = re.sub(r'RELEASE\\s*\\+\\s*\"([^\"]+)\"', lambda m: '\"' + m.group(1) + '\"', source)"
+              )
+              if 'offline-full patch: expand' in text:
+                  return text
+              return text.replace(old, insertion, 1)
+
+          patch('scripts/prepare-bundled-models.py', expand_release_concat,
+                'expand RELEASE + literal in model catalog parsing', allow_noop=True)
+
           # 2) 安装器也有自己的白名单，必须同步，否则启动时的
           #    check(bundled.all { it in modelIds }) 会失败。
           def add_translate_to_installer(text):
@@ -196,10 +215,11 @@ jobs:
           print('All patches applied successfully.', flush=True)
           PY
 
+          cd "$GITHUB_WORKSPACE/cyime-src"
           echo "BUILD_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
           echo "BUILD_DASH=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
-          echo "SHORT_SHA=$(git -C cyime-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          git -C cyime-src diff --stat
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          git diff --stat
 
       - name: Build offline-full Release APKs
         working-directory: cyime-src
@@ -251,8 +271,11 @@ jobs:
           cp cyime-src/app/src/main/assets/NOTICE.txt ./NOTICE.txt
 
           TAG="cyime-offline-${BUILD_DATE}-${SHORT_SHA}"
+          # 源码 checkout 在 cyime-src 子目录，workspace 根目录不是 git 仓库，
+          # 必须显式指定 --repo，否则 gh 无法确定发布到哪个仓库。
+          REPO="${GITHUB_REPOSITORY}"
           # 同一天同一提交重复手动触发时，先删旧 Release，保证幂等
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
 
           cat > RELEASE_NOTES.md <<EOF
           ## CyIME offline-full（自动构建）
@@ -270,6 +293,7 @@ jobs:
           fi
 
           gh release create "$TAG" \
+            --repo "$REPO" \
             --title "CyIME offline-full ${BUILD_DASH} (${SHORT_SHA})" \
             --notes-file RELEASE_NOTES.md \
             --prerelease \
