@@ -343,14 +343,19 @@ jobs:
           patch('app/build-logic/tasks-offline-translate.gradle.kts', patch_translate_lib,
                 'translate library hash -> arm64 from official APK', allow_noop=True)
 
-          # 6) 只构建 arm64-v8a：收紧 ndk.abiFilters 与 splits.abi.include，并关闭 universal APK。
-          #    这样 Gradle 只产出一个 arm64-v8a APK，不再生成 armeabi-v7a / x86 / x86_64 / universal。
+          # 6) 只构建 arm64-v8a：
+          #    - 删除整个 ndk { abiFilters += ... } 块（AGP 9 不允许 ndk.abiFilters 与 splits.abi
+          #      同时指定同一 ABI，否则报 "Conflicting configuration"）；
+          #    - splits.abi.include 只留 arm64-v8a，并关闭 universal APK。
+          #    这样 Gradle 只产出一个 arm64-v8a APK。
           def restrict_to_arm64(text):
               if 'offline-full patch: arm64 only' in text:
                   return text
+              ndk_pat = re.compile(r'^[ \t]*ndk\s*\{[^{}]*abiFilters[^{}]*\}[ \t]*\r?\n?', re.S | re.M)
+              text, n = ndk_pat.subn('', text)
+              if n != 1:
+                  fail(f'expected exactly 1 ndk abiFilters block, found {n}')
               replacements = (
-                  ('abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")',
-                   'abiFilters += listOf("arm64-v8a")  // offline-full patch: arm64 only'),
                   ('include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")',
                    'include("arm64-v8a")  // offline-full patch: arm64 only'),
                   ('isUniversalApk = true',
